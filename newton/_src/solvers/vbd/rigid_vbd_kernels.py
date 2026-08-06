@@ -3822,6 +3822,7 @@ def refresh_body_structural_k(
 def forward_step_rigid_bodies(
     # Inputs
     dt: float,
+    static_solve: bool,
     gravity: wp.array[wp.vec3],
     body_world: wp.array[wp.int32],
     pose_rebaseline_mask: wp.array[wp.bool],
@@ -3840,6 +3841,9 @@ def forward_step_rigid_bodies(
 
     Args:
         dt: Time step [s].
+        static_solve: When ``True``, the momentum term is removed: no velocity is carried into the
+            inertial target, so it is driven by gravity and external wrenches only. Mirrors the
+            particle :func:`forward_step` behavior and yields a quasi-static Newton solve.
         gravity: Gravity vector array (world frame).
         body_world: World index for each body.
         pose_rebaseline_mask: Per-world flags for the ``body_q_prev`` rebaseline below.
@@ -3869,8 +3873,13 @@ def forward_step_rigid_bodies(
         body_inertia_q[tid] = q_current
         return
 
-    # Read body state (only for dynamic bodies)
-    qd_current = body_qd[tid]
+    # Read body state (only for dynamic bodies).
+    # In static-equilibrium mode the momentum term is removed, so no velocity is carried into the
+    # inertial target; only gravity and external wrenches drive it (mirrors particle forward_step).
+    if static_solve:
+        qd_current = wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    else:
+        qd_current = body_qd[tid]
     f_current = body_f[tid]
     com_local = body_com[tid]
     I_local = body_inertia[tid]
@@ -3895,6 +3904,54 @@ def forward_step_rigid_bodies(
     body_q[tid] = q_new
     body_qd[tid] = qd_new
     body_inertia_q[tid] = q_new
+
+
+@wp.kernel
+def chebyshev_accelerate_rigid(
+    omega: float,
+    body_inv_mass: wp.array[float],
+    body_q_prev: wp.array[wp.transform],
+    # in/out: raw Gauss-Seidel pose q_hat -> accelerated pose
+    body_q: wp.array[wp.transform],
+):
+    """Chebyshev semi-iterative acceleration of the rigid AVBD sweep.
+
+    Extrapolates the body pose through the iterate from two sweeps ago:
+    ``q <- omega * (q_hat - q_km1) + q_km1``, where ``q_km1`` is the pose from before the previous
+    sweep. The translation extrapolates linearly (the fixed start pose cancels); the rotation
+    extrapolates component-wise after a double-cover hemisphere alignment and is renormalized. Small
+    inter-sweep rotation increments make the linearized quaternion step accurate. ``omega == 1``
+    reproduces plain Gauss-Seidel. Kinematic bodies (``inv_mass == 0``) are left untouched.
+    """
+    tid = wp.tid()
+    if body_inv_mass[tid] == 0.0:
+        return
+
+    q_hat = body_q[tid]
+    q_km1 = body_q_prev[tid]
+
+    p_hat = wp.transform_get_translation(q_hat)
+    p_km1 = wp.transform_get_translation(q_km1)
+    r_hat = wp.transform_get_rotation(q_hat)
+    r_km1 = wp.transform_get_rotation(q_km1)
+
+    # Linear extrapolation of the translation (the fixed step-start pose cancels).
+    p_new = omega * (p_hat - p_km1) + p_km1
+
+    # Align the previous rotation to the current hemisphere (q and -q are the same rotation) so the
+    # component-wise extrapolation follows the shortest arc rather than the long way around.
+    if r_hat[0] * r_km1[0] + r_hat[1] * r_km1[1] + r_hat[2] * r_km1[2] + r_hat[3] * r_km1[3] < 0.0:
+        r_km1 = wp.quat(-r_km1[0], -r_km1[1], -r_km1[2], -r_km1[3])
+
+    r_new = wp.quat(
+        omega * (r_hat[0] - r_km1[0]) + r_km1[0],
+        omega * (r_hat[1] - r_km1[1]) + r_km1[1],
+        omega * (r_hat[2] - r_km1[2]) + r_km1[2],
+        omega * (r_hat[3] - r_km1[3]) + r_km1[3],
+    )
+    r_new = wp.normalize(r_new)
+
+    body_q[tid] = wp.transform(p_new, r_new)
 
 
 @wp.kernel
@@ -5535,6 +5592,7 @@ def accumulate_body_particle_contacts_per_body(
 @wp.kernel
 def solve_rigid_body(
     dt: float,
+    static_solve: bool,
     body_ids_in_color: wp.array[wp.int32],
     body_q: wp.array[wp.transform],
     body_q_prev: wp.array[wp.transform],
@@ -5610,6 +5668,10 @@ def solve_rigid_body(
 
     Args:
         dt: Time step.
+        static_solve: When ``True``, the inertia (mass/inertia) term is dropped: its Hessian is zero
+            and its force is anchored at the fixed start-of-step pose ``body_q_prev`` so it reduces to
+            the constant gravity/applied load. The per-body Newton system is then governed purely by
+            joints + contacts balanced against gravity (mirrors particle :func:`solve_elasticity`).
         body_ids_in_color: Body indices in current color group (for parallel coloring).
         body_q_prev: Previous body transforms (for damping and friction).
         body_q_rest: Rest transforms (for joint targets).
@@ -5663,13 +5725,25 @@ def solve_rigid_body(
     com_current = pos_current + wp.quat_rotate(rot_current, body_com_local)
     com_star = pos_star + wp.quat_rotate(rot_star, body_com_local)
 
+    # Inertial reference frame. Dynamics anchors the inertial term at the moving iterate
+    # (q_current); the static solve anchors it at the fixed start-of-step pose (body_q_prev), so the
+    # linear force reduces to the constant gravity/applied load and stays put across sweeps rather
+    # than chasing the current position (mirrors the particle static solve evaluating at pos_prev).
+    if static_solve:
+        q_ref = body_q_prev[body_index]
+        rot_ref = wp.transform_get_rotation(q_ref)
+        com_ref = wp.transform_get_translation(q_ref) + wp.quat_rotate(rot_ref, body_com_local)
+    else:
+        rot_ref = rot_current
+        com_ref = com_current
+
     # Linear inertial force and Hessian
     inertial_coeff = m * dt_sqr_reciprocal
-    f_lin = (com_star - com_current) * inertial_coeff
+    f_lin = (com_star - com_ref) * inertial_coeff
 
     # Compute relative rotation via quaternion difference
-    # dq = q_current^-1 * q_star
-    q_delta = wp.mul(wp.quat_inverse(rot_current), rot_star)
+    # dq = q_ref^-1 * q_star
+    q_delta = wp.mul(wp.quat_inverse(rot_ref), rot_star)
 
     # Enforce shortest path (w > 0) to avoid double-cover ambiguity
     if q_delta[3] < 0.0:
@@ -5681,12 +5755,18 @@ def solve_rigid_body(
 
     # Angular inertial torque
     tau_body = I_body * (theta_body * dt_sqr_reciprocal)
-    tau_world = wp.quat_rotate(rot_current, tau_body)
+    tau_world = wp.quat_rotate(rot_ref, tau_body)
 
     # Angular Hessian in world frame: use full inertia (supports off-diagonal products of inertia)
-    R_cur = wp.quat_to_matrix(rot_current)
-    I_world = R_cur * I_body * wp.transpose(R_cur)
+    R_ref = wp.quat_to_matrix(rot_ref)
+    I_world = R_ref * I_body * wp.transpose(R_ref)
     angular_hessian = dt_sqr_reciprocal * I_world
+
+    # Static solve drops the inertia (mass/inertia) Hessian so the per-body Newton system is governed
+    # purely by joints + contacts balanced against the constant gravity load in f_lin/tau_world above.
+    if static_solve:
+        inertial_coeff = 0.0
+        angular_hessian = wp.mat33(0.0)
 
     # Accumulate external forces (rigid contacts)
     # Read external contributions

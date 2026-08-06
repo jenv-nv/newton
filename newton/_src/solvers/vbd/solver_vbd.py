@@ -41,6 +41,7 @@ from .particle_vbd_kernels import (
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
     # Solver kernels (particle VBD)
+    chebyshev_accelerate,
     forward_step,
     reset_particle_state,
     solve_elasticity,
@@ -57,6 +58,7 @@ from .rigid_vbd_kernels import (
     accumulate_body_particle_contacts_per_body,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
+    chebyshev_accelerate_rigid,
     check_contact_overflow,
     compute_rigid_contact_forces,
     compute_rod_dahl_parameters,
@@ -277,6 +279,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         iterations: int = 10,
         friction_epsilon: float = 1e-2,
         integrate_with_external_rigid_solver: bool = False,
+        static_solve: bool = False,
+        particle_chebyshev_rho: float = 0.0,
+        particle_chebyshev_delay: int = 5,
         # Particle parameters
         particle_enable_self_contact: bool = False,
         particle_self_contact_radius: float = 0.2,
@@ -293,6 +298,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_external_edge_contact_filtering_map: dict | None = None,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
+        rigid_chebyshev_rho: float = 0.0,  # Chebyshev spectral radius for rigid AVBD sweeps (0 = disabled)
+        rigid_chebyshev_delay: int = 5,  # Plain (un-accelerated) rigid sweeps before Chebyshev kicks in
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
         rigid_avbd_joint_alpha: float | None = None,  # Joint alpha override
         rigid_avbd_contact_alpha: float | None = None,  # Body-body contact alpha override
@@ -330,6 +337,21 @@ class SolverVBD(SolverBase, CouplingInterface):
                 and rigid body contacts).
             integrate_with_external_rigid_solver: Indicator for coupled rigid body-cloth simulation. When set to `True`,
                 the solver assumes rigid bodies are integrated by an external solver (one-way coupling).
+            static_solve: When `True`, bodies and particles are solved for static equilibrium instead of
+                dynamics: the momentum term is removed from the energy (no velocity carried into the inertial
+                target, zero inertia Hessian), so each step minimizes elastic/joint energy under gravity and
+                external forces only. For rigid bodies the inertia term is anchored at the fixed start-of-step
+                pose so it reduces to a constant gravity/applied load, leaving the per-body Newton system
+                governed by joints and contacts. Output velocities are set to zero. Can be toggled on the
+                instance between steps.
+            particle_chebyshev_rho: Estimated spectral radius (in [0, 1)) of the particle Gauss-Seidel
+                iteration used for Chebyshev semi-iterative acceleration of the VBD sweeps. `0.0` disables
+                acceleration (plain Gauss-Seidel). Values near 1 give more aggressive extrapolation and suit
+                stiff/global-mode problems (e.g. a draping sheet); too-large values can overshoot. Can be
+                tuned on the instance between steps.
+            particle_chebyshev_delay: Number of initial plain (un-accelerated) sweeps per step before
+                Chebyshev extrapolation is enabled, letting high-frequency error settle first. Ignored when
+                `particle_chebyshev_rho` is `0.0`.
 
             Particle parameters:
 
@@ -377,6 +399,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                 ``rho`` internally for numerical conditioning. Values used with legacy
                 hard constraints may require retuning for the desired deformation.
                 Values must be finite and representable in float32; infinity is unsupported.
+            rigid_chebyshev_rho: Estimated spectral radius (in [0, 1)) of the rigid Gauss-Seidel
+                iteration used for Chebyshev semi-iterative acceleration of the per-body sweeps, the rigid
+                analogue of ``particle_chebyshev_rho``. ``0.0`` disables acceleration (plain Gauss-Seidel).
+                Values near 1 give more aggressive extrapolation and suit slow global modes (e.g. a long
+                cable draping under a static solve); too-large values can overshoot. Poses extrapolate on
+                the ``SE(3)`` iterate (translation linearly, rotation via a renormalized quaternion step).
+                Applies to the per-body sweep loop, so it is independent of the constraint formulation
+                selected by ``rigid_compliant_alm``. Can be tuned on the instance between steps.
+            rigid_chebyshev_delay: Number of initial plain (un-accelerated) rigid sweeps per step before
+                Chebyshev extrapolation is enabled, letting high-frequency error settle first. Ignored when
+                ``rigid_chebyshev_rho`` is ``0.0``.
             rigid_avbd_alpha: C0 stabilization strength (``C_stab = C - alpha * C0``). Range: [0, 1].
                 Controls both joints and body-body contacts when neither class-specific
                 override (``rigid_avbd_joint_alpha`` / ``rigid_avbd_contact_alpha``) is set.
@@ -596,6 +629,21 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.friction_epsilon = friction_epsilon
         self._joint_mode_deprecation_warned = False
 
+        # When True, particles are solved for static equilibrium: the momentum term is removed from
+        # the energy (no carried velocity, zero inertia Hessian), leaving only elastic + external
+        # forces. Can be toggled between steps. See :meth:`step`.
+        self.static_solve = static_solve
+
+        # Chebyshev semi-iterative acceleration of the particle VBD sweeps (rho=0 disables).
+        self.particle_chebyshev_rho = particle_chebyshev_rho
+        self.particle_chebyshev_delay = particle_chebyshev_delay
+        self._cheb_omega = 1.0
+
+        # Chebyshev semi-iterative acceleration of the rigid AVBD sweeps (rho=0 disables).
+        self.rigid_chebyshev_rho = rigid_chebyshev_rho
+        self.rigid_chebyshev_delay = rigid_chebyshev_delay
+        self._cheb_omega_rigid = 1.0
+
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
@@ -744,6 +792,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_displacements = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.truncation_ts = wp.zeros(self.model.particle_count, dtype=float, device=self.device)
 
+        # Chebyshev acceleration state: previous-sweep displacement iterate (d_km1) and a scratch
+        # buffer used to roll the current iterate into d_km1 between sweeps. See :meth:`_apply_particle_chebyshev`.
+        self._cheb_displacement_prev = wp.zeros_like(self.particle_displacements)
+        self._cheb_displacement_save = wp.zeros_like(self.particle_displacements)
+
     def _init_rigid_system(
         self,
         model: Model,
@@ -863,6 +916,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             self.body_q_prev = wp.clone(model.body_q, device=self.device)
             self._coupling_body_q_prev_snapshot = wp.clone(model.body_q, device=self.device)
             self.body_inertia_q = wp.zeros_like(model.body_q, device=self.device)  # inertial target poses
+
+            # Chebyshev acceleration state: previous-sweep pose iterate (q_km1) and a scratch buffer used
+            # to roll the current iterate into q_km1 between sweeps. See :meth:`_apply_rigid_chebyshev`.
+            self._cheb_body_q_prev = wp.zeros_like(model.body_q, device=self.device)
+            self._cheb_body_q_save = wp.zeros_like(model.body_q, device=self.device)
 
             # Adjacency and dimensions
             self.rigid_adjacency = self._compute_rigid_force_element_adjacency(model).to(self.device)
@@ -2069,9 +2127,35 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, dt)
 
+        chebyshev = self.particle_chebyshev_rho > 0.0 and self.model.particle_count > 0
+        if chebyshev:
+            # Seed d_km1 with the initial displacement (d^0) and reset the omega recurrence.
+            self._cheb_displacement_prev.assign(self.particle_displacements)
+            self._cheb_omega = 1.0
+
+        rigid_chebyshev = (
+            self.rigid_chebyshev_rho > 0.0
+            and self.model.body_count > 0
+            and not self.integrate_with_external_rigid_solver
+        )
+        if rigid_chebyshev:
+            # Seed q_km1 with the initial pose iterate (q^0) and reset the omega recurrence.
+            self._cheb_body_q_prev.assign(state_in.body_q)
+            self._cheb_omega_rigid = 1.0
+
         for iter_num in range(self.iterations):
+            if rigid_chebyshev:
+                # Save q^k (the pre-sweep pose iterate) before the Gauss-Seidel sweep overwrites it.
+                self._cheb_body_q_save.assign(state_in.body_q)
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+            if rigid_chebyshev:
+                self._apply_rigid_chebyshev(state_in, iter_num)
+            if chebyshev:
+                # Save d^k (the pre-sweep iterate) before Gauss-Seidel overwrites it.
+                self._cheb_displacement_save.assign(self.particle_displacements)
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
+            if chebyshev:
+                self._apply_particle_chebyshev(state_in, state_out, iter_num)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
@@ -2390,6 +2474,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self.model.particle_inv_mass,
                 state_in.particle_f,
                 self.model.particle_flags,
+                self.static_solve,
             ],
             outputs=[
                 self.inertia,
@@ -2664,6 +2749,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kernel=forward_step_rigid_bodies,
                 inputs=[
                     dt,
+                    self.static_solve,
                     model.gravity,
                     model.body_world,
                     self._rigid_pose_rebaseline_mask,
@@ -2970,6 +3056,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
                     inputs=[
                         dt,
+                        self.static_solve,
                         self.model.particle_color_groups[color],
                         self.particle_q_prev,
                         state_in.particle_q,
@@ -3002,6 +3089,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     dim=self.model.particle_color_groups[color].size,
                     inputs=[
                         dt,
+                        self.static_solve,
                         self.model.particle_color_groups[color],
                         self.particle_q_prev,
                         state_in.particle_q,
@@ -3031,6 +3119,94 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._penetration_free_truncation(state_in.particle_q)
 
         wp.copy(state_out.particle_q, state_in.particle_q)
+
+    def _next_chebyshev_omega(self, iter_num: int) -> float:
+        """Chebyshev semi-iterative relaxation factor for sweep ``iter_num``.
+
+        Plain Gauss-Seidel (omega=1) for the first ``particle_chebyshev_delay`` sweeps, then the
+        recurrence ``omega -> 2/(2 - rho^2) -> 4/(4 - rho^2 * omega)`` converging to the optimal factor.
+        """
+        rho2 = self.particle_chebyshev_rho * self.particle_chebyshev_rho
+        delay = self.particle_chebyshev_delay
+        if iter_num <= delay:
+            self._cheb_omega = 1.0
+        elif iter_num == delay + 1:
+            self._cheb_omega = 2.0 / (2.0 - rho2)
+        else:
+            self._cheb_omega = 4.0 / (4.0 - rho2 * self._cheb_omega)
+        return self._cheb_omega
+
+    def _apply_particle_chebyshev(self, state_in: State, state_out: State, iter_num: int):
+        """Extrapolate the particle iterate after one VBD sweep and roll the history buffers.
+
+        Operates on ``particle_displacements`` (position offset from the fixed step-start position),
+        then recomputes positions through the standard truncation path so the ``particle_q``/displacement
+        invariant is preserved. See :func:`chebyshev_accelerate`.
+        """
+        omega = self._next_chebyshev_omega(iter_num)
+        if omega != 1.0:
+            wp.launch(
+                kernel=chebyshev_accelerate,
+                dim=self.model.particle_count,
+                inputs=[
+                    omega,
+                    self.model.particle_flags,
+                    self._cheb_displacement_prev,
+                    self.particle_displacements,
+                ],
+                device=self.device,
+            )
+            # Recompute particle_q = start + accelerated displacement, then resync state_out.
+            self._penetration_free_truncation(state_in.particle_q)
+            wp.copy(state_out.particle_q, state_in.particle_q)
+
+        # Roll history: d_km1 <- d^k (saved before this sweep); reuse the old buffer as next scratch.
+        self._cheb_displacement_prev, self._cheb_displacement_save = (
+            self._cheb_displacement_save,
+            self._cheb_displacement_prev,
+        )
+
+    def _next_rigid_chebyshev_omega(self, iter_num: int) -> float:
+        """Chebyshev relaxation factor for rigid AVBD sweep ``iter_num``.
+
+        The rigid analogue of :meth:`_next_chebyshev_omega`, driven by ``rigid_chebyshev_rho`` /
+        ``rigid_chebyshev_delay`` and its own omega recurrence.
+        """
+        rho2 = self.rigid_chebyshev_rho * self.rigid_chebyshev_rho
+        delay = self.rigid_chebyshev_delay
+        if iter_num <= delay:
+            self._cheb_omega_rigid = 1.0
+        elif iter_num == delay + 1:
+            self._cheb_omega_rigid = 2.0 / (2.0 - rho2)
+        else:
+            self._cheb_omega_rigid = 4.0 / (4.0 - rho2 * self._cheb_omega_rigid)
+        return self._cheb_omega_rigid
+
+    def _apply_rigid_chebyshev(self, state_in: State, iter_num: int):
+        """Extrapolate the rigid pose iterate after one AVBD sweep and roll the history buffers.
+
+        Operates on ``state_in.body_q`` (the in-place Gauss-Seidel pose iterate), leaving kinematic
+        bodies untouched. See :func:`chebyshev_accelerate_rigid`.
+        """
+        omega = self._next_rigid_chebyshev_omega(iter_num)
+        if omega != 1.0:
+            wp.launch(
+                kernel=chebyshev_accelerate_rigid,
+                dim=self.model.body_count,
+                inputs=[
+                    omega,
+                    self.body_inv_mass_effective,
+                    self._cheb_body_q_prev,
+                    state_in.body_q,
+                ],
+                device=self.device,
+            )
+
+        # Roll history: q_km1 <- q^k (saved before this sweep); reuse the old buffer as next scratch.
+        self._cheb_body_q_prev, self._cheb_body_q_save = (
+            self._cheb_body_q_save,
+            self._cheb_body_q_prev,
+        )
 
     def _solve_rigid_body_iteration(
         self,
@@ -3188,6 +3364,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 kernel=solve_rigid_body,
                 inputs=[
                     dt,
+                    self.static_solve,
                     color_group,
                     state_in.body_q,
                     self.body_q_prev,
@@ -3510,6 +3687,12 @@ class SolverVBD(SolverBase, CouplingInterface):
         if self.model.particle_count == 0:
             return
 
+        # In static-equilibrium mode there is no momentum, so report zero velocity rather than the
+        # residual relaxation motion (pos - pos_prev) / dt.
+        if self.static_solve:
+            state_out.particle_qd.zero_()
+            return
+
         wp.launch(
             kernel=update_velocity,
             inputs=[dt, self.particle_q_prev, state_out.particle_q, state_out.particle_qd],
@@ -3540,6 +3723,12 @@ class SolverVBD(SolverBase, CouplingInterface):
             dim=model.body_count,
             device=self.device,
         )
+
+        # In static-equilibrium mode there is no momentum, so report zero velocity rather than the
+        # residual relaxation motion (pose - pose_prev) / dt. Mirrors _finalize_particles behavior.
+        if self.static_solve:
+            state_out.body_qd.zero_()
+            state_in.body_qd.zero_()
 
         if self.enable_dahl_friction and model.joint_count > 0:
             wp.launch(

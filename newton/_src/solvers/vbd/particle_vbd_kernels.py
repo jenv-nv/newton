@@ -1386,6 +1386,7 @@ def forward_step(
     inv_mass: wp.array[float],
     external_force: wp.array[wp.vec3],
     particle_flags: wp.array[wp.int32],
+    static_solve: bool,
     inertia_out: wp.array[wp.vec3],
     displacements_out: wp.array[wp.vec3],
 ):
@@ -1397,9 +1398,16 @@ def forward_step(
         if displacements_out:
             displacements_out[particle] = wp.vec3(0.0, 0.0, 0.0)
         return
+
     world_idx = particle_world[particle]
     world_g = gravity[world_idx]
-    vel_new = vel[particle] + (world_g + external_force[particle] * inv_mass[particle]) * dt
+
+    # In static-equilibrium mode the momentum term is removed from the energy, so no velocity is
+    # carried into the inertial target; only gravity and external forces enter it.
+    if static_solve:
+        vel_new = (world_g + external_force[particle] * inv_mass[particle]) * dt
+    else:
+        vel_new = vel[particle] + (world_g + external_force[particle] * inv_mass[particle]) * dt
     inertia = pos[particle] + vel_new * dt
     inertia_out[particle] = inertia
     if displacements_out:
@@ -1500,6 +1508,30 @@ def apply_conservative_bound_truncation(
 def update_velocity(dt: float, pos_prev: wp.array[wp.vec3], pos: wp.array[wp.vec3], vel: wp.array[wp.vec3]):
     particle = wp.tid()
     vel[particle] = (pos[particle] - pos_prev[particle]) / dt
+
+
+@wp.kernel
+def chebyshev_accelerate(
+    omega: float,
+    particle_flags: wp.array[wp.int32],
+    displacement_prev: wp.array[wp.vec3],
+    # in/out: raw Gauss-Seidel displacement d_hat -> accelerated displacement
+    displacement: wp.array[wp.vec3],
+):
+    """Chebyshev semi-iterative acceleration of the VBD sweep.
+
+    Extrapolates the position iterate through the one from two sweeps ago:
+    ``d <- omega * (d_hat - d_km1) + d_km1`` (equivalently ``omega * d_hat + (1 - omega) * d_km1``),
+    where ``d_km1`` is the iterate from before the previous sweep. ``omega == 1`` reproduces plain
+    Gauss-Seidel. Applied to the start-relative displacement, which equals accelerating positions
+    since the fixed start position cancels.
+    """
+    particle = wp.tid()
+    if not particle_flags[particle] & ParticleFlags.ACTIVE:
+        return
+    d_hat = displacement[particle]
+    d_km1 = displacement_prev[particle]
+    displacement[particle] = omega * (d_hat - d_km1) + d_km1
 
 
 @wp.kernel
@@ -2435,6 +2467,7 @@ def accumulate_particle_body_contact_force_and_hessian(
 @wp.kernel
 def solve_elasticity_tile(
     dt: float,
+    static_solve: bool,
     particle_ids_in_color: wp.array[wp.int32],
     pos_prev: wp.array[wp.vec3],
     pos: wp.array[wp.vec3],
@@ -2581,24 +2614,26 @@ def solve_elasticity_tile(
     h_total = wp.tile_reduce(wp.add, h_tile)[0]
 
     if thread_idx == 0:
-        h_total = (
-            h_total
-            + mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
-            + particle_hessians[particle_index]
-        )
+        # In static-equilibrium mode the momentum term is dropped: the inertia Hessian is zero and the
+        # inertia force is evaluated at pos_prev, reducing to the constant external force (mass*gravity + f_ext).
+        if static_solve:
+            inertia_hessian = wp.mat33(0.0)
+            inertia_force = mass[particle_index] * (inertia[particle_index] - pos_prev[particle_index]) * dt_sqr_reciprocal
+        else:
+            inertia_hessian = mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
+            inertia_force = mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * dt_sqr_reciprocal
+
+        h_total = h_total + inertia_hessian + particle_hessians[particle_index]
         if abs(wp.determinant(h_total)) > 1e-8:
             h_inv = wp.inverse(h_total)
-            f_total = (
-                f_total
-                + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
-                + particle_forces[particle_index]
-            )
+            f_total = f_total + inertia_force + particle_forces[particle_index]
             particle_displacements[particle_index] = particle_displacements[particle_index] + h_inv * f_total
 
 
 @wp.kernel
 def solve_elasticity(
     dt: float,
+    static_solve: bool,
     particle_ids_in_color: wp.array[wp.int32],
     pos_prev: wp.array[wp.vec3],
     pos: wp.array[wp.vec3],
@@ -2633,8 +2668,14 @@ def solve_elasticity(
     dt_sqr_reciprocal = 1.0 / (dt * dt)
 
     # inertia force and hessian
-    f = mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
-    h = mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
+    # In static-equilibrium mode the momentum term is dropped: the inertia Hessian is zero and the
+    # inertia force is evaluated at pos_prev, reducing to the constant external force (mass*gravity + f_ext).
+    if static_solve:
+        f = mass[particle_index] * (inertia[particle_index] - pos_prev[particle_index]) * (dt_sqr_reciprocal)
+        h = wp.mat33(0.0)
+    else:
+        f = mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
+        h = mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
 
     # fmt: off
     if wp.static("inertia_force_hessian" in VBD_DEBUG_PRINTING_OPTIONS):

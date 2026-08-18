@@ -74,6 +74,58 @@ def set_ballbot_torques(
         joint_f[dof] = wp.clamp(torque, -12.0, 12.0)
 
 
+@wp.kernel
+def align_wheel_contact_frames(
+    contact_geom: wp.array[wp.vec2i],
+    contact_worldid: wp.array[int],
+    contact_count: wp.array[int],
+    geom_xmat: wp.array2d[wp.mat33],
+    wheel_geom_mask: wp.array[int],
+    contact_frame: wp.array[wp.mat33],
+):
+    """Rebuild each ball-wheel contact basis around the wheel axis.
+
+    MuJoCo seeds the contact tangent basis from a fixed world axis, so which
+    tangent receives which coefficient of ``mujoco:pair_friction`` depends on the
+    ballbot's heading rather than on the wheel it belongs to. The ball only ever
+    touches the curved side of a wheel, so the wheel axis lies in the contact
+    tangent plane and is exactly the direction that must slide freely; rebuilding
+    the basis around it puts ``_MU_LOW`` on the axis and ``_MU_HIGH`` on the
+    rolling direction at every heading.
+    """
+    contact = wp.tid()
+    if contact >= contact_count[0]:
+        return
+
+    geoms = contact_geom[contact]
+    wheel = int(-1)
+    if wheel_geom_mask[geoms[0]] == 1:
+        wheel = geoms[0]
+    elif wheel_geom_mask[geoms[1]] == 1:
+        wheel = geoms[1]
+    if wheel < 0:
+        return
+
+    normal = contact_frame[contact][0]
+    xmat = geom_xmat[contact_worldid[contact], wheel]
+    axis = wp.vec3(xmat[0, 2], xmat[1, 2], xmat[2, 2])
+
+    slide = axis - normal * wp.dot(normal, axis)
+    # Degenerate only for rim or end-cap contact, where MuJoCo's basis still applies.
+    if wp.length(slide) < 1.0e-6:
+        return
+    slide = wp.normalize(slide)
+    roll = wp.cross(normal, slide)
+
+    # fmt: off
+    contact_frame[contact] = wp.mat33(
+        normal[0], normal[1], normal[2],
+        slide[0], slide[1], slide[2],
+        roll[0], roll[1], roll[2],
+    )
+    # fmt: on
+
+
 def add_anisotropic_wheel(
     builder: newton.ModelBuilder,
     parent: int,
@@ -266,8 +318,11 @@ class Example:
         )
         self.drive_dofs = wp.array(self.drive_dof_indices, dtype=int, device=self.model.device)
         self.drive_directions = wp.array(drive_directions, dtype=wp.vec3, device=self.model.device)
+        # Full-state position, velocity, lean, and lean-rate gains; wheel and yaw damping.
+        # The lean terms are deliberately soft so the recovery from each disturbance
+        # stays visible; stiffening them past roughly -150/-90 flattens it out.
         self.controller_gains = wp.array(
-            [-90.0, -130.0, -75.0, -55.0, 1.25, -15.0],
+            [-20.0, -40.0, -90.0, -65.0, 1.25, -15.0],
             dtype=float,
             device=self.model.device,
         )
@@ -282,6 +337,15 @@ class Example:
             njmax=2048,
             nconmax=1024,
         )
+
+        # The anisotropic pair friction only reaches the intended directions once
+        # the contact basis is rebuilt per wheel; see align_wheel_contact_frames().
+        wheel_geom_mask = np.zeros(self.solver.mj_model.ngeom, dtype=np.int32)
+        for pair in range(self.solver.mj_model.npair):
+            wheel_geom_mask[int(self.solver.mj_model.pair_geom2[pair])] = 1
+        self.wheel_geom_mask = wp.array(wheel_geom_mask, dtype=int, device=self.model.device)
+        self.solver.mjw_model.callback.contactfilter = self.align_contact_frames
+
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -297,6 +361,21 @@ class Example:
         self.viewer.set_camera(pos=wp.vec3(2.4, -3.2, 2.0), pitch=-24.0, yaw=128.0)
         self.device = wp.get_device()
         self.capture()
+
+    def align_contact_frames(self, mjw_model, mjw_data):
+        """Re-align ball-wheel contact bases once narrowphase has written them."""
+        wp.launch(
+            align_wheel_contact_frames,
+            dim=mjw_data.contact.frame.shape[0],
+            inputs=[
+                mjw_data.contact.geom,
+                mjw_data.contact.worldid,
+                mjw_data.nacon,
+                mjw_data.geom_xmat,
+                self.wheel_geom_mask,
+                mjw_data.contact.frame,
+            ],
+        )
 
     def capture(self):
         """Capture one simulation frame."""

@@ -2810,6 +2810,7 @@ def evaluate_joint_force_hessian(
     joint_dof_dim: wp.array2d[int],
     joint_rest_angle: wp.array[float],
     dt: float,
+    static_solve: bool,
 ):
     """Compute VBD joint force and Hessian contributions for one body.
 
@@ -2830,6 +2831,15 @@ def evaluate_joint_force_hessian(
         Legacy drive/limit slots use AVBD-ramped penalty stiffness. Under
         compliant ALM, each free DOF is a scalar finite-material row with its
         own multiplier; active limits project onto the appropriate half-line.
+
+    static_solve: When True, structural (rod stretch/shear/bend/twist and non-rod
+        linear/angular) rate damping is disabled: the discrete dq/dt estimate is taken
+        against the fixed start-of-step body_q_prev, so it does not vanish at equilibrium
+        the way a true velocity would, biasing the static fixed point away from the
+        zero-damping solution the momentum removal targets. Applies to both the legacy
+        and compliant-ALM paths, since the damping read is gated before either is
+        selected. Joint drive/limit damping is not yet gated this way -- see the
+        drive_kd/lim_kd read sites below.
     """
     jt = joint_type[joint_index]
     if (
@@ -2936,7 +2946,7 @@ def evaluate_joint_force_hessian(
 
             K_elastic_diag = wp.vec3(bend_primal_k, bend_primal_k, twist_primal_k)
             K_damp_diag = wp.vec3(kd_bend, kd_bend, kd_twist)
-            damping_active = kd_bend > 0.0 or kd_twist > 0.0
+            damping_active = not static_solve and (kd_bend > 0.0 or kd_twist > 0.0)
 
             bend_alpha = float(0.0)
             twist_alpha = float(0.0)
@@ -3007,7 +3017,7 @@ def evaluate_joint_force_hessian(
 
             k_diag = wp.vec3(shear_primal_k, shear_primal_k, stretch_primal_k)
             kd_diag = wp.vec3(kd_shear, kd_shear, kd_stretch)
-            damping_active = kd_stretch > 0.0 or kd_shear > 0.0
+            damping_active = not static_solve and (kd_stretch > 0.0 or kd_shear > 0.0)
 
             stretch_alpha = float(0.0)
             shear_alpha = float(0.0)
@@ -3069,7 +3079,7 @@ def evaluate_joint_force_hessian(
 
     if jt == JointType.BALL:
         solve_weight = _load_solve_weight(joint_penalty_k, joint_rho, c_start, joint_compliant_alm)
-        damping = joint_penalty_kd[c_start]
+        damping = 0.0 if static_solve else joint_penalty_kd[c_start]
         if solve_weight > 0.0:
             return evaluate_linear_constraint_force_hessian(
                 X_wp,
@@ -3103,7 +3113,7 @@ def evaluate_joint_force_hessian(
 
     if jt == JointType.FIXED:
         solve_weight_lin = _load_solve_weight(joint_penalty_k, joint_rho, c_start + 0, joint_compliant_alm)
-        kd_lin = joint_penalty_kd[c_start + 0]
+        kd_lin = 0.0 if static_solve else joint_penalty_kd[c_start + 0]
         if solve_weight_lin > 0.0:
             f_lin, t_lin, Hll_lin, Hal_lin, Haa_lin = evaluate_linear_constraint_force_hessian(
                 X_wp,
@@ -3133,7 +3143,7 @@ def evaluate_joint_force_hessian(
             Haa_lin = wp.mat33(0.0)
 
         solve_weight_ang = _load_solve_weight(joint_penalty_k, joint_rho, c_start + 1, joint_compliant_alm)
-        kd_ang = joint_penalty_kd[c_start + 1]
+        kd_ang = 0.0 if static_solve else joint_penalty_kd[c_start + 1]
         if solve_weight_ang > 0.0:
             t_ang, Haa_ang, _ang_kappa, _ang_J = evaluate_angular_constraint_force_hessian(
                 q_wp,
@@ -3165,7 +3175,7 @@ def evaluate_joint_force_hessian(
         a = wp.normalize(joint_axis[qd_start])
 
         solve_weight_lin = _load_solve_weight(joint_penalty_k, joint_rho, c_start + 0, joint_compliant_alm)
-        kd_lin = joint_penalty_kd[c_start + 0]
+        kd_lin = 0.0 if static_solve else joint_penalty_kd[c_start + 0]
         if solve_weight_lin > 0.0:
             f_lin, t_lin, Hll_lin, Hal_lin, Haa_lin = evaluate_linear_constraint_force_hessian(
                 X_wp,
@@ -3195,7 +3205,7 @@ def evaluate_joint_force_hessian(
             Haa_lin = wp.mat33(0.0)
 
         solve_weight_ang = _load_solve_weight(joint_penalty_k, joint_rho, c_start + 1, joint_compliant_alm)
-        kd_ang = joint_penalty_kd[c_start + 1]
+        kd_ang = 0.0 if static_solve else joint_penalty_kd[c_start + 1]
 
         kappa_cached = wp.vec3(0.0)
         J_world_cached = wp.mat33(0.0)
@@ -3227,6 +3237,9 @@ def evaluate_joint_force_hessian(
 
         # Drive + limits on free angular DOF (constraint slot c_start + 2)
         dof_idx = qd_start
+        # TODO(static_solve): drive/limit damping (axis_dl.drive_kd, axis_dl limit kd) is not
+        # gated for static_solve the way the structural kd_lin/kd_ang above are -- same
+        # dt-doesn't-vanish-at-equilibrium issue. Does not affect passive (undriven) joints.
         axis_dl = _load_joint_axis_drive_limit(
             dof_idx,
             joint_target_q_start[joint_index],
@@ -3286,7 +3299,7 @@ def evaluate_joint_force_hessian(
         P_lin, P_ang = build_joint_projectors(jt, joint_axis, qd_start, 1, 0, q_wp)
 
         solve_weight_lin = _load_solve_weight(joint_penalty_k, joint_rho, c_start + 0, joint_compliant_alm)
-        kd_lin = joint_penalty_kd[c_start + 0]
+        kd_lin = 0.0 if static_solve else joint_penalty_kd[c_start + 0]
         if solve_weight_lin > 0.0:
             f_lin, t_lin, Hll_lin, Hal_lin, Haa_lin = evaluate_linear_constraint_force_hessian(
                 X_wp,
@@ -3316,7 +3329,7 @@ def evaluate_joint_force_hessian(
             Haa_lin = wp.mat33(0.0)
 
         solve_weight_ang = _load_solve_weight(joint_penalty_k, joint_rho, c_start + 1, joint_compliant_alm)
-        kd_ang = joint_penalty_kd[c_start + 1]
+        kd_ang = 0.0 if static_solve else joint_penalty_kd[c_start + 1]
         if solve_weight_ang > 0.0:
             t_ang, Haa_ang, _ang_kappa, _ang_J = evaluate_angular_constraint_force_hessian(
                 q_wp,
@@ -3342,6 +3355,9 @@ def evaluate_joint_force_hessian(
 
         # Drive + limits on free linear DOF (constraint slot c_start + 2)
         dof_idx = qd_start
+        # TODO(static_solve): drive/limit damping (axis_dl.drive_kd, axis_dl limit kd) is not
+        # gated for static_solve the way the structural kd_lin/kd_ang above are -- same
+        # dt-doesn't-vanish-at-equilibrium issue. Does not affect passive (undriven) joints.
         axis_dl = _load_joint_axis_drive_limit(
             dof_idx,
             joint_target_q_start[joint_index],
@@ -3429,7 +3445,7 @@ def evaluate_joint_force_hessian(
 
         # Linear constraint (constrained when lin_count < 3)
         solve_weight_lin = _load_solve_weight(joint_penalty_k, joint_rho, c_start + 0, joint_compliant_alm)
-        kd_lin = joint_penalty_kd[c_start + 0]
+        kd_lin = 0.0 if static_solve else joint_penalty_kd[c_start + 0]
 
         if lin_count < 3 and solve_weight_lin > 0.0:
             f_l, t_l, Hll_l, Hal_l, Haa_l = evaluate_linear_constraint_force_hessian(
@@ -3460,7 +3476,7 @@ def evaluate_joint_force_hessian(
 
         # Angular constraint (constrained when ang_count < 3)
         solve_weight_ang = _load_solve_weight(joint_penalty_k, joint_rho, c_start + 1, joint_compliant_alm)
-        kd_ang = joint_penalty_kd[c_start + 1]
+        kd_ang = 0.0 if static_solve else joint_penalty_kd[c_start + 1]
 
         kappa_cached = wp.vec3(0.0)
         J_world_cached = wp.mat33(0.0)
@@ -3513,6 +3529,9 @@ def evaluate_joint_force_hessian(
             for li in range(3):
                 if li < lin_count:
                     dof_idx = qd_start + li
+                    # TODO(static_solve): drive/limit damping is not gated for static_solve
+                    # the way the structural kd_lin/kd_ang above are -- same
+                    # dt-doesn't-vanish-at-equilibrium issue.
                     axis_dl = _load_joint_axis_drive_limit(
                         dof_idx,
                         target_q_base + li,
@@ -3577,6 +3596,9 @@ def evaluate_joint_force_hessian(
             for ai in range(3):
                 if ai < ang_count:
                     dof_idx = qd_start + lin_count + ai
+                    # TODO(static_solve): drive/limit damping is not gated for static_solve
+                    # the way the structural kd_lin/kd_ang above are -- same
+                    # dt-doesn't-vanish-at-equilibrium issue.
                     axis_dl = _load_joint_axis_drive_limit(
                         dof_idx,
                         target_q_base + lin_count + ai,
@@ -5843,6 +5865,7 @@ def solve_rigid_body(
             joint_dof_dim,
             joint_rest_angle,
             dt,
+            static_solve,
         )
 
         f_force = f_force + joint_force

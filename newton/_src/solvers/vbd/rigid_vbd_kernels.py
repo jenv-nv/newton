@@ -3909,6 +3909,8 @@ def forward_step_rigid_bodies(
     body_inertia: wp.array[wp.mat33],
     body_inv_mass: wp.array[float],
     body_inv_inertia: wp.array[wp.mat33],
+    drag_linear: float,
+    drag_angular: float,
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_q_prev: wp.array[wp.transform],
@@ -3923,6 +3925,12 @@ def forward_step_rigid_bodies(
         body_world: World index for each body.
         pose_rebaseline_mask: Per-world flags for the ``body_q_prev`` rebaseline below.
         body_f: External forces on bodies (spatial wrenches, world frame).
+        drag_linear: Aerodynamic linear drag coefficient [N·s/m]. Applied as an
+            IMPLICIT viscous force ``-drag_linear·v`` inside ``integrate_rigid_body``
+            (see there), which is unconditionally stable. Zero disables it. Forced to
+            zero under ``static_solve`` (drag vanishes at the v=0 equilibrium).
+        drag_angular: Aerodynamic angular drag coefficient [N·m·s/rad]. Applied as an
+            implicit viscous torque ``-drag_angular·ω`` the same way.
         body_com: Centers of mass (local body frame).
         body_inertia: Inertia tensors (local body frame).
         body_inv_mass: Inverse masses (0 for kinematic bodies).
@@ -3956,7 +3964,15 @@ def forward_step_rigid_bodies(
     inv_I = body_inv_inertia[tid]
     world_g = gravity[world_idx]
 
-    # Integrate rigid body motion (semi-implicit Euler, no angular damping)
+    # Aerodynamic drag is a velocity-proportional force, so it is identically zero at the
+    # v=0 equilibrium a static solve seeks. Disable it there: under static_solve qd_current
+    # is already zeroed above, but the IMPLICIT drag would still scale the gravity-driven
+    # prediction and merely slow convergence. Passing 0/0 keeps the static equilibrium
+    # bit-identical to an un-damped solve.
+    drag_lin_eff = float(0.0) if static_solve else drag_linear
+    drag_ang_eff = float(0.0) if static_solve else drag_angular
+
+    # Integrate rigid body motion (semi-implicit Euler with implicit aerodynamic drag).
     q_new, qd_new = integrate_rigid_body(
         q_current,
         qd_current,
@@ -3968,6 +3984,8 @@ def forward_step_rigid_bodies(
         world_g,
         0.0,  # angular_damping = 0 (consistent with particle VBD)
         dt,
+        drag_lin_eff,
+        drag_ang_eff,
     )
 
     # Update current transform, velocity, and set inertial target

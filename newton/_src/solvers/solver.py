@@ -72,6 +72,8 @@ def integrate_rigid_body(
     gravity: wp.vec3,
     angular_damping: float,
     dt: float,
+    drag_linear: float,
+    drag_angular: float,
 ):
     # unpack transform
     x0 = wp.transform_get_translation(q)
@@ -89,13 +91,32 @@ def integrate_rigid_body(
 
     # linear part
     v1 = v0 + (f0 * inv_mass + gravity * wp.nonzero(inv_mass)) * dt
+    # Implicit (backward-Euler) aerodynamic linear drag: a viscous force -drag_linear·v
+    # evaluated at the END-of-step velocity, i.e. m(v1-v0)/dt = f + m·g - drag_linear·v1.
+    # Solving for v1 divides the undamped prediction by (1 + drag_linear·inv_mass·dt).
+    # This is the exact solution of dv/dt = -(drag_linear·inv_mass)·v, so it is
+    # unconditionally stable (the factor is in (0,1] for every coefficient and dt) and
+    # never injects energy. drag_linear == 0 leaves v1 exactly unchanged.
+    v1 = v1 / (1.0 + drag_linear * inv_mass * dt)
+    # Damp BEFORE forming the pose so the drag actually curbs the predicted motion
+    # (VBD uses this pose as its inertial target), not just the reported velocity.
     x1 = x_com + v1 * dt
 
     # angular part (compute in body frame)
     wb = wp.quat_rotate_inv(r0, w0)
     tb = wp.quat_rotate_inv(r0, t0) - wp.cross(wb, inertia * wb)  # coriolis forces
 
-    w1 = wp.quat_rotate(r0, wb + inv_inertia * tb * dt)
+    wb1 = wb + inv_inertia * tb * dt
+    # Implicit angular drag: a viscous torque -drag_angular·ω at the end-of-step angular
+    # velocity. In the body frame that is (I3 + drag_angular·dt·inv_inertia)·wb1 = wb1_undamped,
+    # a 3x3 solve that is tensor-correct for an anisotropic rod (isotropic inertia reduces
+    # to the same 1/(1+drag_angular·inv_I·dt) scaling as the linear channel). Guarded so
+    # drag_angular == 0 is bit-identical to the un-damped integrator.
+    if drag_angular > 0.0:
+        a = drag_angular * dt
+        m_drag = wp.identity(n=3, dtype=float) + a * inv_inertia
+        wb1 = wp.inverse(m_drag) * wb1
+    w1 = wp.quat_rotate(r0, wb1)
     r1 = wp.normalize(r0 + wp.quat(w1, 0.0) * r0 * 0.5 * dt)
 
     # angular damping
@@ -164,6 +185,8 @@ def integrate_bodies(
         world_g,
         angular_damping,
         dt,
+        0.0,  # drag_linear: SemiImplicit has no aerodynamic drag
+        0.0,  # drag_angular
     )
 
     body_q_new[tid] = q_new

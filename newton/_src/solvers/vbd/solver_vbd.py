@@ -323,6 +323,14 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_joint_angular_k_start: float = 1.0e1,  # Legacy AVBD angular joint penalty ramp seed
         rigid_joint_linear_kd: float = 0.0,  # Absolute damping for non-rod linear joint constraints
         rigid_joint_angular_kd: float = 0.0,  # Absolute damping for non-rod angular joint constraints
+        # Aerodynamic drag: viscous wrench opposing each body's absolute (world-frame)
+        # velocity, applied IMPLICITLY (backward Euler) in the forward-step integrator,
+        # so it is unconditionally stable for any coefficient/timestep. Unlike the joint
+        # kd terms above (which act on RELATIVE joint velocity, i.e. shape change),
+        # these dissipate BULK motion of the cable — the regime air resistance lives
+        # in. Disabled under static_solve (drag is zero at the v=0 equilibrium).
+        drag_linear: float = 0.0,  # linear drag coefficient [N·s/m]; force  = -drag_linear·v
+        drag_angular: float = 0.0,  # angular drag coefficient [N·m·s/rad]; torque = -drag_angular·ω
         deterministic: wp.DeterministicMode | None = None,
     ):
         """
@@ -648,6 +656,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             rigid_joint_angular_k_start,
             rigid_joint_linear_kd,
             rigid_joint_angular_kd,
+            drag_linear,
+            drag_angular,
         )
 
         # Controls whether the next step() refreshes contact state derived from
@@ -772,6 +782,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         rigid_joint_angular_k_start: float,
         rigid_joint_linear_kd: float,
         rigid_joint_angular_kd: float,
+        drag_linear: float,
+        drag_angular: float,
     ) -> None:
         """Initialize rigid-body VBD data structures and settings.
 
@@ -848,6 +860,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_joint_angular_ke = rigid_joint_angular_ke
         self.rigid_joint_linear_kd = max(0.0, rigid_joint_linear_kd)
         self.rigid_joint_angular_kd = max(0.0, rigid_joint_angular_kd)
+        # Aerodynamic drag coefficients (see __init__ docstring). Mutable on the
+        # instance between steps, like the chebyshev/static_solve knobs.
+        self.drag_linear = max(0.0, drag_linear)
+        self.drag_angular = max(0.0, drag_angular)
 
         # -------------------------------------------------------------
         # Rigid-only solver state (used when SolverVBD integrates bodies)
@@ -2723,6 +2739,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     model.body_inertia,
                     self.body_inv_mass_effective,
                     self.body_inv_inertia_effective,
+                    self.drag_linear,
+                    self.drag_angular,
                     state_in.body_q,  # input/output
                     state_in.body_qd,  # input/output
                 ],

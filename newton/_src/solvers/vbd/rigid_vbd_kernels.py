@@ -3909,8 +3909,8 @@ def forward_step_rigid_bodies(
     body_inertia: wp.array[wp.mat33],
     body_inv_mass: wp.array[float],
     body_inv_inertia: wp.array[wp.mat33],
-    drag_linear: float,
-    drag_angular: float,
+    body_drag_linear: wp.array[float],
+    body_drag_angular: wp.array[float],
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
     body_q_prev: wp.array[wp.transform],
@@ -3925,12 +3925,12 @@ def forward_step_rigid_bodies(
         body_world: World index for each body.
         pose_rebaseline_mask: Per-world flags for the ``body_q_prev`` rebaseline below.
         body_f: External forces on bodies (spatial wrenches, world frame).
-        drag_linear: Aerodynamic linear drag coefficient [N·s/m]. Applied as an
-            IMPLICIT viscous force ``-drag_linear·v`` inside ``integrate_rigid_body``
-            (see there), which is unconditionally stable. Zero disables it. Forced to
-            zero under ``static_solve`` (drag vanishes at the v=0 equilibrium).
-        drag_angular: Aerodynamic angular drag coefficient [N·m·s/rad]. Applied as an
-            implicit viscous torque ``-drag_angular·ω`` the same way.
+        body_drag_linear: Per-body aerodynamic linear drag coefficient [N·s/m]. Applied
+            as an IMPLICIT viscous force ``-drag·v`` inside ``integrate_rigid_body`` (see
+            there), which is unconditionally stable. Zero disables it. Forced to zero
+            under ``static_solve`` (drag vanishes at the v=0 equilibrium).
+        body_drag_angular: Per-body aerodynamic angular drag coefficient [N·m·s/rad].
+            Applied as an implicit viscous torque ``-drag·ω`` the same way.
         body_com: Centers of mass (local body frame).
         body_inertia: Inertia tensors (local body frame).
         body_inv_mass: Inverse masses (0 for kinematic bodies).
@@ -3969,8 +3969,8 @@ def forward_step_rigid_bodies(
     # is already zeroed above, but the IMPLICIT drag would still scale the gravity-driven
     # prediction and merely slow convergence. Passing 0/0 keeps the static equilibrium
     # bit-identical to an un-damped solve.
-    drag_lin_eff = float(0.0) if static_solve else drag_linear
-    drag_ang_eff = float(0.0) if static_solve else drag_angular
+    drag_lin_eff = float(0.0) if static_solve else body_drag_linear[tid]
+    drag_ang_eff = float(0.0) if static_solve else body_drag_angular[tid]
 
     # Integrate rigid body motion (semi-implicit Euler with implicit aerodynamic drag).
     q_new, qd_new = integrate_rigid_body(

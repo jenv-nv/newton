@@ -860,10 +860,16 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.rigid_joint_angular_ke = rigid_joint_angular_ke
         self.rigid_joint_linear_kd = max(0.0, rigid_joint_linear_kd)
         self.rigid_joint_angular_kd = max(0.0, rigid_joint_angular_kd)
-        # Aerodynamic drag coefficients (see __init__ docstring). Mutable on the
-        # instance between steps, like the chebyshev/static_solve knobs.
-        self.drag_linear = max(0.0, drag_linear)
-        self.drag_angular = max(0.0, drag_angular)
+        # Aerodynamic drag coefficients (see __init__ docstring). Stored PER BODY so a
+        # batched solve (a population of parallel worlds) can give each body its own
+        # coefficient; the scalar ``drag_linear``/``drag_angular`` properties broadcast a
+        # uniform value, and ``set_body_drag()`` assigns per-body arrays directly. Mutable
+        # between steps like the chebyshev/static_solve knobs.
+        n_bodies = self.model.body_count
+        self._drag_linear_uniform = max(0.0, drag_linear)
+        self._drag_angular_uniform = max(0.0, drag_angular)
+        self._body_drag_linear = wp.full((n_bodies,), self._drag_linear_uniform, dtype=float, device=self.device)
+        self._body_drag_angular = wp.full((n_bodies,), self._drag_angular_uniform, dtype=float, device=self.device)
 
         # -------------------------------------------------------------
         # Rigid-only solver state (used when SolverVBD integrates bodies)
@@ -1042,6 +1048,41 @@ class SolverVBD(SolverBase, CouplingInterface):
                 "model.body_color_groups is empty but rigid bodies are present! When using the SolverVBD you must call ModelBuilder.color() "
                 "or ModelBuilder.set_coloring() before calling ModelBuilder.finalize()."
             )
+
+    @property
+    def drag_linear(self) -> float:
+        """Uniform aerodynamic linear drag coefficient [N·s/m]. Setting it broadcasts the
+        value to every body; ``set_body_drag`` overrides individual bodies."""
+        return self._drag_linear_uniform
+
+    @drag_linear.setter
+    def drag_linear(self, value: float) -> None:
+        self._drag_linear_uniform = max(0.0, float(value))
+        if self._body_drag_linear.shape[0] > 0:
+            self._body_drag_linear.fill_(self._drag_linear_uniform)
+
+    @property
+    def drag_angular(self) -> float:
+        """Uniform aerodynamic angular drag coefficient [N·m·s/rad]. See ``drag_linear``."""
+        return self._drag_angular_uniform
+
+    @drag_angular.setter
+    def drag_angular(self, value: float) -> None:
+        self._drag_angular_uniform = max(0.0, float(value))
+        if self._body_drag_angular.shape[0] > 0:
+            self._body_drag_angular.fill_(self._drag_angular_uniform)
+
+    def set_body_drag(self, linear=None, angular=None) -> None:
+        """Assign PER-BODY aerodynamic drag coefficients, length ``model.body_count``.
+
+        Overrides the uniform value set through ``drag_linear``/``drag_angular`` so a
+        batched solve can give each parallel world (each body) its own coefficient.
+        ``linear``/``angular`` are array-likes; pass ``None`` to leave that channel as-is.
+        """
+        if linear is not None:
+            self._body_drag_linear.assign(np.ascontiguousarray(np.asarray(linear, dtype=np.float32)))
+        if angular is not None:
+            self._body_drag_angular.assign(np.ascontiguousarray(np.asarray(angular, dtype=np.float32)))
 
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
@@ -2739,8 +2780,8 @@ class SolverVBD(SolverBase, CouplingInterface):
                     model.body_inertia,
                     self.body_inv_mass_effective,
                     self.body_inv_inertia_effective,
-                    self.drag_linear,
-                    self.drag_angular,
+                    self._body_drag_linear,
+                    self._body_drag_angular,
                     state_in.body_q,  # input/output
                     state_in.body_qd,  # input/output
                 ],

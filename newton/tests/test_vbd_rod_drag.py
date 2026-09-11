@@ -193,6 +193,40 @@ class TestVBDRodDrag(unittest.TestCase):
         # Implicit drag can never overshoot: the decay factor 1/(1+c·inv_m·dt) is in (0,1].
         self.assertGreaterEqual(lin_drag.min(), -1e-9, "drag drove speed negative (overshoot)")
 
+    def test_per_body_drag_decays_bodies_independently(self):
+        """set_body_drag gives each body its own coefficient in a single batched solve.
+
+        Two free bodies with no gravity and the same initial speed, one with strong
+        drag and one with none: after stepping the same solver, the dragged body must
+        be much slower and the drag-free body essentially unchanged. This is the
+        capability a batched population fit relies on (each parallel world its own drag).
+        """
+        device = wp.get_preferred_device()
+        with wp.ScopedDevice(device):
+            builder = newton.ModelBuilder()
+            for _ in range(2):
+                builder.add_body(mass=0.2, inertia=wp.mat33(1e-3, 0, 0, 0, 1e-3, 0, 0, 0, 1e-3))
+            builder.color()
+            model = builder.finalize(device=device)
+            model.set_gravity((0.0, 0.0, 0.0))
+
+            solver = SolverVBD(model, iterations=30)
+            inv_m = float(model.body_inv_mass.numpy()[0])
+            # Body 0: strong drag; body 1: none.
+            solver.set_body_drag(linear=[5.0 / inv_m, 0.0])
+
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            qd = state_0.body_qd.numpy()
+            qd[:, 0] = 0.5  # both bodies moving at 0.5 m/s in +x
+            state_0.body_qd = wp.array(qd, dtype=wp.spatial_vector, device=device)
+            for _ in range(40):
+                solver.step(state_0, state_1, control, None, _DT)
+                state_0, state_1 = state_1, state_0
+            v = state_0.body_qd.numpy()[:, 0]
+
+        self.assertLess(float(v[0]), 0.2 * 0.5, "dragged body did not slow down")
+        self.assertAlmostEqual(float(v[1]), 0.5, delta=0.05, msg="drag-free body was affected")
+
     def test_implicit_drag_stable_at_huge_coefficient(self):
         """A coefficient far past the explicit stability limit stays bounded and decays.
 

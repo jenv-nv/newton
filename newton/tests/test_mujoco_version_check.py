@@ -1,10 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
+import math
 import types
 import unittest
 import warnings
 from unittest import mock
+
+import numpy as np
 
 from newton._src.solvers.mujoco import solver_mujoco
 from newton.exceptions import NewtonWarning
@@ -113,18 +117,21 @@ class TestMuJoCoVersionCheck(unittest.TestCase):
 
 
 class TestMuJoCoDeterminismConfig(unittest.TestCase):
-    def test_only_dynamic_record_modules_receive_model_bound(self):
+    def test_modules_receive_their_record_bounds(self):
+        """Give the smooth and solver modules their own record bounds and other modules 0."""
         solver = object.__new__(solver_mujoco.SolverMuJoCo)
         solver._deterministic = solver_mujoco.wp.DeterministicMode.RUN_TO_RUN
         solver._deterministic_max_records = 17
+        solver._deterministic_solver_max_records = 3
         smooth_module = types.SimpleNamespace(__name__="mujoco_warp._src.smooth")
+        solver_module = types.SimpleNamespace(__name__="mujoco_warp._src.solver")
         forward_module = types.SimpleNamespace(__name__="mujoco_warp._src.forward")
 
         with (
             mock.patch.object(
                 solver_mujoco,
                 "_mujoco_warp_deterministic_modules",
-                return_value=[smooth_module, forward_module],
+                return_value=[smooth_module, solver_module, forward_module],
             ),
             mock.patch.object(solver, "_set_module_options") as set_module_options,
         ):
@@ -134,6 +141,10 @@ class TestMuJoCoDeterminismConfig(unittest.TestCase):
             "deterministic": solver_mujoco.wp.DeterministicMode.RUN_TO_RUN,
             "deterministic_max_records": 17,
         }
+        solver_options = {
+            "deterministic": solver_mujoco.wp.DeterministicMode.RUN_TO_RUN,
+            "deterministic_max_records": 3,
+        }
         generated_options = {
             "deterministic": solver_mujoco.wp.DeterministicMode.RUN_TO_RUN,
             "deterministic_max_records": 0,
@@ -142,6 +153,7 @@ class TestMuJoCoDeterminismConfig(unittest.TestCase):
             set_module_options.call_args_list,
             [
                 mock.call(dynamic_options, module=smooth_module),
+                mock.call(solver_options, module=solver_module),
                 mock.call(generated_options, module=forward_module),
                 mock.call(generated_options, module=solver_mujoco.kernels),
                 mock.call(
@@ -150,6 +162,38 @@ class TestMuJoCoDeterminismConfig(unittest.TestCase):
                 ),
             ],
         )
+
+    @unittest.skipUnless(importlib.util.find_spec("mujoco_warp"), "mujoco_warp is not installed")
+    def test_solver_record_bound_matches_dense_elliptic_launch(self):
+        """Match the solver record bound to MJWarp's dense elliptic Hessian kernel launch."""
+        from mujoco_warp import ConeType, EnableBit, IntegratorType, SolverType
+
+        def bound(*, is_cuda=True, cone=ConeType.ELLIPTIC, solver=SolverType.NEWTON, is_sparse=False, ntri=300, **opt):
+            options = {"enableflags": 0, "integrator": IntegratorType.EULER, **opt}
+            mjw_model = types.SimpleNamespace(
+                opt=types.SimpleNamespace(cone=cone, solver=solver, **options),
+                is_sparse=is_sparse,
+                dof_tri_row=np.zeros(ntri, dtype=np.int32),
+            )
+            mjw_data = types.SimpleNamespace(naconmax=1000, cdof_tri_row=np.zeros(32 * 32, dtype=np.int32))
+            device = types.SimpleNamespace(is_cuda=is_cuda, sm_count=20)
+            return solver_mujoco._mujoco_warp_solver_deterministic_max_records(mjw_model, mjw_data, device)
+
+        # nv = 24 gives 300 DOF pairs, so the launch uses ceil(20 * 1536 / 300) = 103 blocks.
+        self.assertEqual(bound(), math.ceil(1000 / 103))
+        # Sleeping runs the compact solve over 32 * 32 DOF pairs, so the launch uses 30 blocks.
+        self.assertEqual(bound(enableflags=EnableBit.SLEEP), math.ceil(1000 / 30))
+        self.assertEqual(bound(enableflags=EnableBit.SLEEP, integrator=IntegratorType.DISCRETE), math.ceil(1000 / 103))
+        for name, kwargs in {
+            "cpu": {"is_cuda": False},
+            "pyramidal": {"cone": ConeType.PYRAMIDAL},
+            "cg": {"solver": SolverType.CG},
+            "sparse": {"is_sparse": True},
+            "sparse_sleeping": {"is_sparse": True, "enableflags": EnableBit.SLEEP},
+            "no_dofs": {"ntri": 0},
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(bound(**kwargs), 0)
 
     def test_scoped_config_uses_solver_mode_and_restores_globals(self):
         solver = object.__new__(solver_mujoco.SolverMuJoCo)

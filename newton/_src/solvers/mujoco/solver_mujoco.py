@@ -287,6 +287,7 @@ def _mujoco_warp_deterministic_modules() -> list[Any]:
 
 
 _MUJOCO_WARP_DYNAMIC_RECORD_MODULES = frozenset({"mujoco_warp._src.smooth"})
+_MUJOCO_WARP_SOLVER_MODULE = "mujoco_warp._src.solver"
 
 
 def _mujoco_warp_max_constraint_row_width(mj_model: MjModel) -> int:
@@ -339,6 +340,40 @@ def _mujoco_warp_deterministic_max_records(mj_model: MjModel, mjw_data: MjWarpDa
         tendon_records = max(tendon_records, 2 * segment_count * int(row_width))
 
     return max(1, constraint_records, hessian_records, tendon_records)
+
+
+def _mujoco_warp_solver_deterministic_max_records(
+    mjw_model: MjWarpModel, mjw_data: MjWarpData, device: wp.Device
+) -> int:
+    """Compute the per-thread deterministic atomic record bound for MJWarp's solver module.
+
+    On CUDA, the dense elliptic-cone Newton kernel ``_update_gradient_JTCJ_dense``
+    accumulates one Hessian record per contact for ``ceil(naconmax / dim_block)``
+    contacts per thread. Warp's code generation counts these records once per
+    thread. With sleeping, MJWarp launches the kernel in the compact solve over
+    ``nvmax_pad * nvmax_pad`` DOF pairs instead of the full DOF triangle; a
+    sparse full model skips the kernel in both solves. Returns 0 to keep the
+    code-generated bound when the kernel does not run.
+
+    The scatter buffers of each launch then hold about ``naconmax`` times the
+    DOF pair count records, so keep ``nconmax`` tight in deterministic mode.
+    """
+    from mujoco_warp import ConeType, EnableBit, IntegratorType, SolverType
+
+    compact = mjw_model.opt.enableflags & EnableBit.SLEEP and mjw_model.opt.integrator != IntegratorType.DISCRETE
+    ntri = mjw_data.cdof_tri_row.size if compact else mjw_model.dof_tri_row.size
+    if (
+        not device.is_cuda
+        or ntri == 0
+        or mjw_model.opt.solver != SolverType.NEWTON
+        or mjw_model.opt.cone != ConeType.ELLIPTIC
+        or mjw_model.is_sparse
+    ):
+        return 0
+
+    # Same block count as the kernel launch in mujoco_warp/_src/solver.py (_update_gradient).
+    dim_block = math.ceil(device.sm_count * 6 * 256 / ntri)
+    return math.ceil(mjw_data.naconmax / dim_block)
 
 
 def _mesh_scale_key(mesh: Mesh, scale: np.ndarray) -> tuple[int, tuple[float, float, float], int]:
@@ -891,11 +926,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # The contact conversion kernel lives in its own fast-math module.
         contact_module = convert_newton_contacts_to_mjwarp_kernel.module
         for module in [*_mujoco_warp_deterministic_modules(), kernels, contact_module]:
-            max_records = (
-                self._deterministic_max_records
-                if getattr(module, "__name__", None) in _MUJOCO_WARP_DYNAMIC_RECORD_MODULES
-                else 0
-            )
+            module_name = getattr(module, "__name__", None)
+            if module_name in _MUJOCO_WARP_DYNAMIC_RECORD_MODULES:
+                max_records = self._deterministic_max_records
+            elif module_name == _MUJOCO_WARP_SOLVER_MODULE:
+                max_records = self._deterministic_solver_max_records
+            else:
+                max_records = 0
             options = {
                 "deterministic": self._deterministic,
                 "deterministic_max_records": max_records,
@@ -4453,6 +4490,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._deterministic = deterministic if deterministic is not None else wp.config.deterministic
         self._strict_capacity = strict_capacity
         self._deterministic_max_records = 0
+        self._deterministic_solver_max_records = 0
         if not use_mujoco_cpu:
             # MJWarp's step pipeline spans several modules (forward dynamics,
             # smooth dynamics, constraints, solver, and optional collision).
@@ -9070,6 +9108,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 if self._deterministic != wp.DeterministicMode.NOT_GUARANTEED:
                     self._deterministic_max_records = _mujoco_warp_deterministic_max_records(
                         self.mj_model, self.mjw_data
+                    )
+                    self._deterministic_solver_max_records = _mujoco_warp_solver_deterministic_max_records(
+                        self.mjw_model, self.mjw_data, self.model.device
                     )
                 self._set_mujoco_warp_module_options()
                 self._prepare_generated_kernels()

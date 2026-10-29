@@ -1,0 +1,1 @@
+Fix deterministic `SolverMuJoCo` raising a Warp scatter buffer overflow in `_update_gradient_JTCJ_dense`, or silently dropping contact Hessian contributions under CUDA graph capture, when many contacts use the elliptic friction cone with the Newton solver and a dense Jacobian, for example in models replicated into several worlds.

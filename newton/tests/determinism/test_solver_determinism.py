@@ -251,6 +251,65 @@ def test_articulation_determinism(test, device, solver_name):
     _run_isolated(test, "_check_articulation_determinism", str(device), solver_name)
 
 
+def _build_sliding_boxes(device, world_count):
+    world = newton.ModelBuilder()
+    newton.solvers.SolverMuJoCo.register_custom_attributes(world)
+    cfg = newton.ModelBuilder.ShapeConfig(density=500.0, mu=0.2)
+    for i in range(8):
+        body = world.add_body(xform=wp.transform(wp.vec3(0.6 * i, 0.0, 0.1), wp.quat_identity()))
+        world.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=cfg, custom_attributes={"mujoco:condim": 4})
+
+    builder = newton.ModelBuilder()
+    newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+    builder.replicate(world, world_count)
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.2))
+    return builder.finalize(device=device)
+
+
+def _run_mujoco_elliptic_contact_rollout(device):
+    # 8 worlds with 32 sliding contacts each make MJWarp's dense elliptic-cone
+    # Hessian kernel accumulate several contacts per thread on GPUs with up to 195 SMs.
+    model = _build_sliding_boxes(device, world_count=8)
+    solver = newton.solvers.SolverMuJoCo(
+        model,
+        use_mujoco_cpu=False,
+        use_mujoco_contacts=False,
+        cone="elliptic",
+        impratio=10.0,
+        jacobian="dense",
+        deterministic=DETERMINISTIC_MODE,
+    )
+    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    contacts = pipeline.contacts()
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
+
+    # A 20 N push exceeds the 7.8 N Coulomb limit, so every box slides.
+    push = np.zeros((model.body_count, 6), dtype=np.float32)
+    push[:, 0] = 20.0
+    for _ in range(5):
+        state_0.body_f.assign(push)
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+
+    return _snapshot(state_0, ("body_q", "body_qd", "joint_q", "joint_qd"))
+
+
+def _check_mujoco_elliptic_contact_determinism(device):
+    with wp.ScopedDevice(device):
+        first = _run_mujoco_elliptic_contact_rollout(device)
+        second = _run_mujoco_elliptic_contact_rollout(device)
+    _assert_snapshots_equal(first, second)
+
+
+def test_mujoco_elliptic_contact_determinism(test, device):
+    """Reproduce bit-identical MuJoCo rollouts with many elliptic-cone contacts per world."""
+    _skip_unsupported_mujoco_determinism(test)
+    _run_isolated(test, "_check_mujoco_elliptic_contact_determinism", str(device))
+
+
 class TestSolverDeterminism(unittest.TestCase):
     pass
 
@@ -486,6 +545,14 @@ for solver_name in ("featherstone", "mujoco"):
         solver_name=solver_name,
         check_output=False,
     )
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_mujoco_elliptic_contact_determinism",
+    test_mujoco_elliptic_contact_determinism,
+    devices=devices,
+    check_output=False,
+)
 
 add_function_test(
     TestSolverDeterminism,
